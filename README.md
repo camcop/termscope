@@ -244,6 +244,7 @@ close_on_exit = true
 | `TERMSCOPE_TV` | Absolute Television binary. Set by the Herdr wrapper when the installer recorded a path or Homebrew `tv` exists off `PATH`. |
 | `TERMSCOPE_OPENER` | Override default opener, e.g. `open -a Zen` or `open -a Firefox` |
 | `TERMSCOPE_SORT` | Default sort: `appearance` (default) or `alpha` |
+| `TERMSCOPE_AGENT_TRANSCRIPTS` | `0` stops Termscope reading Claude Code and pi transcripts to rejoin URLs and paths those agents wrapped (Herdr only). Default: on |
 | `BAT_THEME` | `bat` theme for file previews. Default: `ansi`, the terminal's own colors, so text stays readable on light and dark themes |
 | `TERMSCOPE_LOG` | JSON event log path. Default: `$XDG_CACHE_HOME/termscope/termscope.log` (`~/.cache/...` if unset) |
 | `TERMSCOPE_DEBUG_DIR` | Directory for per-run debug dumps (unset = off) |
@@ -288,8 +289,12 @@ an absolute Television path when Homebrew `tv` is off the popup `PATH`. It
 captures visible text from every pane in the tab with
 `herdr pane read --source recent-unwrapped --lines <viewport rows>`, so paths
 the terminal soft-wrapped across rows come back whole (a pane scrolled into its
-history uses `--source visible`), scans the repo with `fd`, and runs
-Television. Two bundled channels let `Ctrl-S` cycle between
+history uses `--source visible`). Coding agents with their own TUI, such as
+Claude Code and pi, break long lines themselves, so for a pane Herdr reports as
+running one of them, Termscope reads the end of that session's transcript and
+rejoins two rows when the URL or path cut at the end of one, plus the start of
+the next, appears unbroken in the transcript. It then scans the repo with `fd`
+and runs Television. Two bundled channels let `Ctrl-S` cycle between
 appearance and alphabetical order. File previews use `bat` when available and a
 built-in text preview otherwise.
 

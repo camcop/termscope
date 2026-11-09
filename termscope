@@ -318,7 +318,23 @@ class HerdrBackend(MultiplexerBackend):
         return pane_path
 
     def capture_pane_text(self, pane_id: str) -> str:
-        return "\n".join(self._read_visible(pane) for pane in self._tab_panes(pane_id))
+        return "\n".join(self._read_pane(pane) for pane in self._tab_panes(pane_id))
+
+    def _read_pane(self, pane: dict) -> str:
+        text = self._read_visible(pane)
+        if not agent_transcripts_enabled():
+            return text
+        transcript_path = agent_transcript_path(pane.get("agent_session"))
+        if transcript_path is None:
+            return text
+        text, joins = rejoin_agent_wraps(text, read_transcript_text(transcript_path))
+        log_event(
+            "agent_rejoin",
+            pane_id=pane.get("pane_id"),
+            transcript=str(transcript_path),
+            joins=joins,
+        )
+        return text
 
     def _read_visible(self, pane: dict) -> str:
         """The pane's visible rows, with soft-wrapped lines joined back together.
@@ -534,6 +550,131 @@ def find_search_root(pane_path: Path) -> Path:
     except FileNotFoundError:
         pass
     return pane_path
+
+
+# --------------------------------------------------------------------------- #
+# Agent transcripts: rejoin lines an agent broke itself
+# --------------------------------------------------------------------------- #
+
+# Coding agents with their own TUI (Claude Code, pi) wrap long lines themselves,
+# with a real newline and an indent, so `recent-unwrapped` can't rejoin them and
+# a long URL or path reaches the picker cut in two. The agent's session transcript
+# still has the unbroken text, so two screen lines are joined back together when
+# the token cut at the end of one, plus the token that starts the next, appears in
+# the transcript as one string and looks like a URL or path.
+
+TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
+_REJOIN_LEADING = "([{<\"'`*"
+_REJOIN_TRAILING = ")]}>\"'`*.,;:!?"
+_REJOIN_MIN_LENGTH = 12
+_REJOIN_LINKISH_RE = re.compile(r"/|\\|://|\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])")
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def agent_transcripts_enabled() -> bool:
+    return os.environ.get("TERMSCOPE_AGENT_TRANSCRIPTS", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def agent_transcript_path(agent_session: object) -> Path | None:
+    """The session transcript behind a Herdr pane's `agent_session`, if it can be found."""
+    if not isinstance(agent_session, dict):
+        return None
+    value = agent_session.get("value")
+    if not isinstance(value, str) or not value:
+        return None
+    if agent_session.get("kind") == "path":
+        path = Path(value).expanduser()
+        return path if path.is_file() else None
+    if not _SESSION_ID_RE.fullmatch(value):
+        return None
+    agent = agent_session.get("agent")
+    if agent == "claude":
+        config = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+        root, pattern = Path(config) / "projects", f"*/{value}.jsonl"
+    elif agent == "pi":
+        config = os.environ.get("PI_CODING_AGENT_DIR") or str(Path.home() / ".pi" / "agent")
+        root, pattern = Path(config) / "sessions", f"*/*_{value}.jsonl"
+    else:
+        return None
+    try:
+        matches = sorted(root.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    return matches[0] if matches else None
+
+
+def read_transcript_text(path: Path, tail_bytes: int = TRANSCRIPT_TAIL_BYTES) -> str:
+    """Every string in the last `tail_bytes` of a JSONL transcript, one per line."""
+    try:
+        with path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - tail_bytes))
+            data = fh.read()
+    except OSError:
+        return ""
+    lines = data.split(b"\n")
+    if size > tail_bytes:
+        lines = lines[1:]  # starts mid-record
+    strings: list[str] = []
+    for raw in lines:
+        try:
+            stack = [json.loads(raw)]
+        except ValueError:
+            continue
+        while stack:
+            item = stack.pop()
+            if isinstance(item, str):
+                strings.append(item)
+            elif isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
+    return "\n".join(strings)
+
+
+def _rejoin_pair(line: str, following: str, transcript: str) -> str | None:
+    head = line.rstrip()
+    tail_match = re.search(r"\S+$", head)
+    body = following.lstrip()
+    lead_match = re.match(r"\S+", body)
+    if not tail_match or not lead_match:
+        return None
+    left = tail_match.group(0).lstrip(_REJOIN_LEADING)
+    right = lead_match.group(0).rstrip(_REJOIN_TRAILING)
+    joined = left + right
+    if (
+        not left
+        or not right
+        or len(joined) < _REJOIN_MIN_LENGTH
+        or not _REJOIN_LINKISH_RE.search(joined)
+        or joined not in transcript
+    ):
+        return None
+    return head + body
+
+
+def rejoin_agent_wraps(screen_text: str, transcript: str) -> tuple[str, int]:
+    """Join screen lines the agent broke inside a URL or path; returns (text, joins)."""
+    if not transcript:
+        return screen_text, 0
+    lines = screen_text.split("\n")
+    out: list[str] = []
+    joins = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        while i + 1 < len(lines):
+            joined = _rejoin_pair(line, lines[i + 1], transcript)
+            if joined is None:
+                break
+            line = joined
+            joins += 1
+            i += 1
+        out.append(line)
+        i += 1
+    return "\n".join(out), joins
 
 
 # --------------------------------------------------------------------------- #

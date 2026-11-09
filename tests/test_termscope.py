@@ -2378,5 +2378,153 @@ class TestLinkPickerCopy(unittest.TestCase):
         message.assert_not_called()
 
 
+class TestAgentTranscriptRejoin(unittest.TestCase):
+    """Agents that wrap their own output: rejoin URLs and paths using the session transcript."""
+
+    URL = "https://www.neowin.net/amp/proton-pass-plus-cuts-its-annual-prices-down-to-just-199-a-month-for-its-password-manager/"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+
+    def _write_jsonl(self, path, records):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        return path
+
+    def test_rejoins_url_broken_by_agent(self):
+        screen = (
+            "  - Neowin: Proton Pass Plus annual price cut\n"
+            "    (https://www.neowin.net/amp/proton-pass-plus-cuts-its-annual-prices-down-to\n"
+            "    -just-199-a-month-for-its-password-manager/)\n"
+        )
+        transcript = f"- Neowin: Proton Pass Plus annual price cut ({self.URL})"
+        fixed, joins = tfp.rejoin_agent_wraps(screen, transcript)
+        self.assertEqual(joins, 1)
+        self.assertEqual(tfp.extract_visible_links(fixed), [self.URL])
+        self.assertEqual(
+            tfp.extract_visible_links(screen),
+            ["https://www.neowin.net/amp/proton-pass-plus-cuts-its-annual-prices-down-to"],
+        )
+
+    def test_rejoins_across_several_rows(self):
+        url = "https://example.com/" + "segment-" * 30 + "end"
+        rows = [url[i:i + 60] for i in range(0, len(url), 60)]
+        screen = "  " + "\n  ".join(rows) + "\n  next line\n"
+        fixed, joins = tfp.rejoin_agent_wraps(screen, f"see {url} for details")
+        self.assertEqual(joins, len(rows) - 1)
+        self.assertEqual(tfp.extract_visible_links(fixed), [url])
+
+    def test_rejoins_path_broken_by_agent(self):
+        screen = "  see .config/dotfile\n  s/docs/herdr.md:87 for the notes\n"
+        fixed, joins = tfp.rejoin_agent_wraps(screen, "see `.config/dotfiles/docs/herdr.md:87` for the notes")
+        self.assertEqual(joins, 1)
+        self.assertIn(".config/dotfiles/docs/herdr.md:87", fixed)
+
+    def test_leaves_lines_alone_without_transcript_evidence(self):
+        screen = "  (https://example.com/a/very/long/path/that/was\n  -cut-here)\n"
+        fixed, joins = tfp.rejoin_agent_wraps(screen, "https://example.com/a/very/long/path/that/was cut here")
+        self.assertEqual((fixed, joins), (screen, 0))
+
+    def test_does_not_join_prose(self):
+        # "nevertheless" is long enough and in the transcript, but it is not a URL or path.
+        screen = "  it works, never\n  theless we should check\n"
+        fixed, joins = tfp.rejoin_agent_wraps(screen, "it works, nevertheless we should check")
+        self.assertEqual((fixed, joins), (screen, 0))
+
+    def test_does_not_join_when_next_line_is_punctuation_only(self):
+        screen = "  https://example.com/some/long/path/here\n  )\n"
+        fixed, joins = tfp.rejoin_agent_wraps(screen, "(https://example.com/some/long/path/here)")
+        self.assertEqual(joins, 0)
+
+    def test_no_transcript_is_a_no_op(self):
+        screen = "a\nb\n"
+        self.assertEqual(tfp.rejoin_agent_wraps(screen, ""), (screen, 0))
+
+    def test_read_transcript_text_collects_nested_strings(self):
+        path = self._write_jsonl(self.base / "s.jsonl", [
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": f"link: {self.URL}"}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": [{"type": "text", "text": "out/report.md"}]}]}},
+        ])
+        text = tfp.read_transcript_text(path)
+        self.assertIn(self.URL, text)
+        self.assertIn("out/report.md", text)
+
+    def test_read_transcript_text_reads_only_the_tail(self):
+        path = self._write_jsonl(self.base / "s.jsonl", [
+            {"text": "old " + "x" * 200},
+            {"text": "new https://example.com/recent"},
+        ])
+        text = tfp.read_transcript_text(path, tail_bytes=60)
+        self.assertIn("https://example.com/recent", text)
+        self.assertNotIn("old", text)
+
+    def test_read_transcript_text_missing_file(self):
+        self.assertEqual(tfp.read_transcript_text(self.base / "missing.jsonl"), "")
+
+    def test_agent_transcript_path_finds_claude_session(self):
+        path = self._write_jsonl(self.base / "claude" / "projects" / "-repo" / "abc-123.jsonl", [{}])
+        with patch.dict(tfp.os.environ, {"CLAUDE_CONFIG_DIR": str(self.base / "claude")}):
+            found = tfp.agent_transcript_path({"agent": "claude", "kind": "id", "value": "abc-123"})
+        self.assertEqual(found, path)
+
+    def test_agent_transcript_path_finds_pi_session(self):
+        path = self._write_jsonl(
+            self.base / "pi" / "sessions" / "--repo--" / "2026-11-09T10-00-00-000Z_0199-xyz.jsonl", [{}]
+        )
+        with patch.dict(tfp.os.environ, {"PI_CODING_AGENT_DIR": str(self.base / "pi")}):
+            found = tfp.agent_transcript_path({"agent": "pi", "kind": "id", "value": "0199-xyz"})
+        self.assertEqual(found, path)
+
+    def test_agent_transcript_path_accepts_a_path(self):
+        path = self._write_jsonl(self.base / "t.jsonl", [{}])
+        self.assertEqual(tfp.agent_transcript_path({"agent": "x", "kind": "path", "value": str(path)}), path)
+
+    def test_agent_transcript_path_rejects_unknown_or_unsafe(self):
+        with patch.dict(tfp.os.environ, {"CLAUDE_CONFIG_DIR": str(self.base)}):
+            self.assertIsNone(tfp.agent_transcript_path(None))
+            self.assertIsNone(tfp.agent_transcript_path({"agent": "codex", "kind": "id", "value": "abc"}))
+            self.assertIsNone(tfp.agent_transcript_path({"agent": "claude", "kind": "id", "value": "../*"}))
+            self.assertIsNone(tfp.agent_transcript_path({"agent": "claude", "kind": "id", "value": "nope"}))
+
+    def _capture(self, agent_session, env=None):
+        pane_list = {"result": {"panes": [{
+            "pane_id": "w1:p1", "tab_id": "w1:t1", "agent_session": agent_session,
+            "scroll": {"viewport_rows": 10, "offset_from_bottom": 0},
+        }]}}
+        screen = "  (https://www.neowin.net/amp/proton-pass-plus-cuts-its-annual-prices-down-to\n  -just-199-a-month-for-its-password-manager/)\n"
+
+        def fake_run(cmd, **kwargs):
+            if cmd[1:3] == ["pane", "list"]:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(pane_list))
+            return SimpleNamespace(returncode=0, stdout=screen)
+
+        self._write_jsonl(self.base / "projects" / "-repo" / "sess-1.jsonl", [
+            {"message": {"content": [{"type": "text", "text": f"({self.URL})"}]}},
+        ])
+        backend = tfp.HerdrBackend()
+        environ = {"HERDR_PANE_ID": "w9:p9", "CLAUDE_CONFIG_DIR": str(self.base), **(env or {})}
+        with patch.dict(tfp.os.environ, environ), \
+             patch.object(tfp.subprocess, "run", side_effect=fake_run), \
+             patch.object(backend, "_herdr_bin", return_value="herdr"):
+            return tfp.extract_visible_links(backend.capture_pane_text("w1:p1"))
+
+    def test_herdr_capture_rejoins_claude_pane(self):
+        links = self._capture({"agent": "claude", "kind": "id", "value": "sess-1"})
+        self.assertEqual(links, [self.URL])
+
+    def test_herdr_capture_without_agent_session_is_unchanged(self):
+        links = self._capture(None)
+        self.assertEqual(links, ["https://www.neowin.net/amp/proton-pass-plus-cuts-its-annual-prices-down-to"])
+
+    def test_herdr_capture_respects_opt_out(self):
+        links = self._capture(
+            {"agent": "claude", "kind": "id", "value": "sess-1"},
+            env={"TERMSCOPE_AGENT_TRANSCRIPTS": "0"},
+        )
+        self.assertEqual(links, ["https://www.neowin.net/amp/proton-pass-plus-cuts-its-annual-prices-down-to"])
+
+
 if __name__ == "__main__":
     unittest.main()
