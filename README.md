@@ -162,7 +162,13 @@ paths plus any visible `http://` / `https://` URLs.
 - Results keep the order they appear on screen.
 - If no visible file matches, the picker falls back to the full repo listing
   (visible URLs stay first). Indexing `$HOME` is skipped.
-- `termscope.open-links` is URLs only.
+- `termscope.open-links` lists URLs, plus issue and PR refs: `#12`,
+  `repo#12` and `owner/repo#12` become `https://<host>/<owner>/<repo>/issues/12`,
+  with the host, owner and repo filled in from the source pane's `origin`
+  remote. GitHub, Gitea and Forgejo redirect that URL to the pull request when
+  the number is one. An SSH remote's host goes through `ssh -G`, and a bare
+  name such as `gitea` is completed by DNS (e.g. Tailscale MagicDNS) to the
+  full name the web server's certificate covers.
 
 With the bindings above:
 
@@ -194,6 +200,7 @@ Link picker:
 | Key | Action |
 | --- | --- |
 | `Enter` | Open URL with the default opener |
+| `Ctrl-E` | Open the URL in a new Neovim split, for a `BufReadCmd` there to render (e.g. an issue view) |
 | `Ctrl-Y` | Copy URL, or send OSC 52 to the terminal |
 | `Ctrl-S` | Cycle appearance order / alphabetical sort |
 
@@ -244,6 +251,7 @@ close_on_exit = true
 | `TERMSCOPE_TV` | Absolute Television binary. Set by the Herdr wrapper when the installer recorded a path or Homebrew `tv` exists off `PATH`. |
 | `TERMSCOPE_OPENER` | Override default opener, e.g. `open -a Zen` or `open -a Firefox` |
 | `TERMSCOPE_SORT` | Default sort: `appearance` (default) or `alpha` |
+| `TERMSCOPE_FORGE_REFS` | `0` leaves issue and PR refs (`#12`, `owner/repo#12`) out of the link picker. Default: on |
 | `TERMSCOPE_AGENT_TRANSCRIPTS` | `0` stops Termscope reading Claude Code and pi transcripts to rejoin URLs and paths those agents wrapped (Herdr only). Default: on |
 | `BAT_THEME` | `bat` theme for file previews. Default: `ansi`, the terminal's own colors, so text stays readable on light and dark themes |
 | `TERMSCOPE_LOG` | JSON event log path. Default: `$XDG_CACHE_HOME/termscope/termscope.log` (`~/.cache/...` if unset) |

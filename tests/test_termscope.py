@@ -114,6 +114,141 @@ class TestExtractVisibleLinks(unittest.TestCase):
         )
 
 
+class TestExtractForgeRefs(unittest.TestCase):
+    def refs(self, line):
+        return [(owner, repo, number) for _, owner, repo, number in tfp.extract_forge_refs(line)]
+
+    def test_bare_ref(self):
+        self.assertEqual(self.refs("Refs #12 and (#3)"), [(None, None, "12"), (None, None, "3")])
+
+    def test_repo_and_owner_repo_refs(self):
+        self.assertEqual(
+            self.refs("home_server#794, cam/workflow#50."),
+            [(None, "home_server", "794"), ("cam", "workflow", "50")],
+        )
+
+    def test_ignores_url_fragments_entities_and_words(self):
+        self.assertEqual(self.refs("https://x.test/pull/3#issuecomment-9 page#12x &#123; ##4"), [])
+
+    def test_ignores_paths(self):
+        self.assertEqual(self.refs("./b#2 a/b/c#3 ~/x#4"), [])
+
+
+class TestExtractVisibleLinksWithRefs(unittest.TestCase):
+    @staticmethod
+    def resolve(owner, repo, number):
+        if number == "0":
+            return None
+        return f"https://g.test/{owner or 'cam'}/{repo or 'home'}/issues/{number}"
+
+    def test_refs_join_urls_in_screen_order(self):
+        text = "see #4\nhttps://example.com and cam/workflow#50\n#4 again"
+        self.assertEqual(
+            tfp.extract_visible_links(text, resolve_ref=self.resolve),
+            [
+                "https://g.test/cam/home/issues/4",
+                "https://example.com",
+                "https://g.test/cam/workflow/issues/50",
+            ],
+        )
+
+    def test_unresolved_refs_are_dropped(self):
+        self.assertEqual(tfp.extract_visible_links("#0", resolve_ref=self.resolve), [])
+
+    def test_no_resolver_means_no_refs(self):
+        self.assertEqual(tfp.extract_visible_links("Refs #12"), [])
+
+
+class TestParseRemoteUrl(unittest.TestCase):
+    def test_scp_style_alias(self):
+        self.assertEqual(
+            tfp.parse_remote_url("gitea@gitea:cam/workflow.git\n"),
+            ("gitea", "cam", "workflow", True),
+        )
+
+    def test_https(self):
+        self.assertEqual(
+            tfp.parse_remote_url("https://github.com/iurysza/termscope.git"),
+            ("github.com", "iurysza", "termscope", False),
+        )
+
+    def test_ssh_url_with_port_and_subgroup(self):
+        self.assertEqual(
+            tfp.parse_remote_url("ssh://git@host.test:2222/grp/sub/repo.git"),
+            ("host.test", "grp/sub", "repo", True),
+        )
+
+    def test_unparseable(self):
+        self.assertIsNone(tfp.parse_remote_url("/srv/git/repo.git"))
+
+
+class TestForgeRefResolver(unittest.TestCase):
+    def test_resolves_lazily_once(self):
+        calls = []
+
+        def repo_path():
+            calls.append(1)
+            return Path("/tmp/repo")
+
+        with patch.object(tfp, "forge_remote", return_value=("https://g.test", "cam", "home")) as remote:
+            resolve = tfp.forge_ref_resolver(repo_path)
+            self.assertEqual(calls, [])
+            self.assertEqual(resolve(None, None, "7"), "https://g.test/cam/home/issues/7")
+            self.assertEqual(resolve(None, "workflow", "8"), "https://g.test/cam/workflow/issues/8")
+            self.assertEqual(resolve("me", "x", "9"), "https://g.test/me/x/issues/9")
+        remote.assert_called_once_with(Path("/tmp/repo"))
+        self.assertEqual(calls, [1])
+
+    def test_no_remote_drops_refs(self):
+        with patch.object(tfp, "forge_remote", return_value=None):
+            self.assertIsNone(tfp.forge_ref_resolver(lambda: Path("/tmp"))(None, None, "7"))
+
+    def test_ssh_remote_uses_web_host(self):
+        run = SimpleNamespace(returncode=0, stdout="gitea@gitea:cam/workflow.git\n")
+        with patch.object(tfp.subprocess, "run", return_value=run), \
+             patch.object(tfp, "_web_host", return_value="gitea.example.ts.net") as web:
+            self.assertEqual(
+                tfp.forge_remote(Path("/tmp/repo")),
+                ("https://gitea.example.ts.net", "cam", "workflow"),
+            )
+        web.assert_called_once_with("gitea")
+
+
+class TestLinkPickerRefs(unittest.TestCase):
+    def _run(self, screen, result, env=None):
+        args = SimpleNamespace(pane_path="/tmp/repo", pane_id="%1")
+        with patch.dict(os.environ, env or {}), \
+             patch.object(tfp, "capture_pane_text", return_value=screen), \
+             patch.object(tfp, "strip_ansi", side_effect=lambda text: text), \
+             patch.object(tfp, "resolve_source_pane_path", return_value=Path("/tmp/src")) as source, \
+             patch.object(tfp, "forge_remote", return_value=("https://g.test", "cam", "home")), \
+             patch.object(tfp, "run_tv_links", return_value=result) as picker, \
+             patch.object(tfp, "copy_to_clipboard", return_value="copied"), \
+             patch.object(tfp, "open_url") as opener, \
+             patch.object(tfp, "open_in_nvim_split") as nvim, \
+             patch.object(tfp, "show_message"):
+            tfp.cmd_links(args)
+        return picker, opener, nvim, source
+
+    def test_refs_are_listed(self):
+        picker, *_ = self._run("Refs #12\n", tfp.PickerResult())
+        self.assertEqual(picker.call_args.args[0], ["https://g.test/cam/home/issues/12"])
+
+    def test_refs_off(self):
+        picker, *_ = self._run("Refs #12\n", tfp.PickerResult(), {"TERMSCOPE_FORGE_REFS": "0"})
+        picker.assert_not_called()
+
+    def test_no_ref_skips_source_lookup(self):
+        *_, source = self._run("https://example.com\n", tfp.PickerResult())
+        source.assert_not_called()
+
+    def test_ctrl_e_opens_in_nvim(self):
+        url = "https://g.test/cam/home/issues/12"
+        _, opener, nvim, _ = self._run("#12\n", tfp.PickerResult(selection=url, key="ctrl-e"))
+        opener.assert_not_called()
+        self.assertEqual(nvim.call_args.args[:3], (url, "", Path("/tmp/src")))
+
+
 class TestParseSelectedTarget(unittest.TestCase):
     def test_plain_path(self):
         p = tfp.parse_selected_target("src/main.py")
@@ -1286,7 +1421,7 @@ class TestTelevisionCommands(unittest.TestCase):
         self.assertIn("--no-preview", command)
         self.assertNotIn("--preview-word-wrap", command)
         expect_index = command.index("--expect")
-        self.assertEqual(command[expect_index + 1], "ctrl-y")
+        self.assertEqual(command[expect_index + 1], "ctrl-e;ctrl-y")
 
     def test_full_repo_uses_repo_files(self):
         with patch.object(tfp, "list_repo_files", return_value=["src/main.py"]), \

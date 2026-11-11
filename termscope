@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import NoReturn
+from typing import Callable, NoReturn
 
 
 # --------------------------------------------------------------------------- #
@@ -737,7 +738,16 @@ def sort_items(items: dict[str, int], sort: str = "appearance") -> list[str]:
     ]
 
 
-def extract_visible_links(screen_text: str, sort: str = "appearance") -> list[str]:
+def extract_visible_links(
+    screen_text: str,
+    sort: str = "appearance",
+    resolve_ref: Callable[[str | None, str | None, str], str | None] | None = None,
+) -> list[str]:
+    """URLs on screen, in order. With ``resolve_ref``, issue/PR refs too.
+
+    ``resolve_ref(owner, repo, number)`` turns a ``#12`` / ``repo#12`` /
+    ``owner/repo#12`` ref into a URL, or returns None to drop it.
+    """
     raw_lines = screen_text.splitlines()
     matches: dict[str, int] = {}
 
@@ -755,8 +765,128 @@ def extract_visible_links(screen_text: str, sort: str = "appearance") -> list[st
             add(m.group(1), i)
         for m in URL_RE.finditer(line):
             add(m.group(0), i)
+        if resolve_ref is not None:
+            for _, owner, repo, number in extract_forge_refs(line):
+                url = resolve_ref(owner, repo, number)
+                if url:
+                    add(url, i)
 
     return sort_items(matches, sort)
+
+
+# --------------------------------------------------------------------------- #
+# Issue / PR references
+# --------------------------------------------------------------------------- #
+
+# `#12`, `repo#12`, `owner/repo#12`. Not after a word, path, `&` (HTML
+# entities) or another `#`, and not followed by a word character.
+FORGE_REF_RE = re.compile(
+    r"(?<![\w/#&.-])(?:(?:([A-Za-z0-9][\w.-]*)/)?([A-Za-z0-9][\w.-]*))?#(\d{1,6})(?![\w-])"
+)
+_REMOTE_URL_RE = re.compile(r"^https?://(?:[^@/]+@)?([^/]+)/(.+?)(?:\.git)?/?$", re.IGNORECASE)
+_REMOTE_SSH_RE = re.compile(r"^(?:ssh://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$")
+
+
+def forge_refs_enabled() -> bool:
+    """Issue/PR refs in the link picker; TERMSCOPE_FORGE_REFS=0 turns them off."""
+    return os.environ.get("TERMSCOPE_FORGE_REFS", "1") != "0"
+
+
+def extract_forge_refs(line: str) -> list[tuple[int, str | None, str | None, str]]:
+    """(column, owner, repo, number) for each issue/PR ref outside a URL."""
+    # Blank out URLs so `…/pull/3#issuecomment-9` or `page#12` never match.
+    masked = URL_RE.sub(lambda m: " " * len(m.group(0)), line)
+    return [
+        (m.start(), m.group(1), m.group(2), m.group(3))
+        for m in FORGE_REF_RE.finditer(masked)
+    ]
+
+
+def _web_host(host: str) -> str:
+    """The web host behind a remote's host, which may be an SSH alias."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", host], text=True, capture_output=True, check=False, timeout=2
+        )
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition(" ")
+            if key == "hostname" and value:
+                host = value.strip()
+                break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    if "." not in host:
+        # A bare name that DNS search domains complete (e.g. a Tailscale
+        # MagicDNS short name): use the full name, which the TLS cert covers.
+        try:
+            info = socket.getaddrinfo(host, 443, flags=socket.AI_CANONNAME)
+            if info and info[0][3]:
+                host = info[0][3]
+        except OSError:
+            pass
+    return host
+
+
+def parse_remote_url(url: str) -> tuple[str, str, str, bool] | None:
+    """(host, owner, repo, is_ssh) from a git remote URL."""
+    url = url.strip()
+    m = _REMOTE_URL_RE.match(url)
+    is_ssh = False
+    if not m:
+        m = _REMOTE_SSH_RE.match(url)
+        is_ssh = True
+    if not m:
+        return None
+    host, path = m.group(1), m.group(2)
+    owner, _, repo = path.rpartition("/")
+    if not owner or not repo:
+        return None
+    return host, owner, repo, is_ssh
+
+
+def forge_remote(path: Path) -> tuple[str, str, str] | None:
+    """(web base URL, owner, repo) of the `origin` remote of the repo at path."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    parsed = parse_remote_url(result.stdout)
+    if parsed is None:
+        return None
+    host, owner, repo, is_ssh = parsed
+    if is_ssh:
+        host = _web_host(host)
+    return f"https://{host}", owner, repo
+
+
+def forge_ref_resolver(
+    repo_path: Callable[[], Path],
+) -> Callable[[str | None, str | None, str], str | None]:
+    """Resolve refs against the repo at repo_path(), looked up on first use.
+
+    `/issues/N` also covers PRs: GitHub, Gitea and Forgejo redirect it to the
+    pull request when N is one.
+    """
+    remote: list[tuple[str, str, str] | None] = []
+
+    def resolve(owner: str | None, repo: str | None, number: str) -> str | None:
+        if not remote:
+            remote.append(forge_remote(repo_path()))
+            log_event("forge_remote", remote=remote[0])
+        if remote[0] is None:
+            return None
+        base, default_owner, default_repo = remote[0]
+        return f"{base}/{owner or default_owner}/{repo or default_repo}/issues/{number}"
+
+    return resolve
 
 
 def merge_link_candidates(candidates: list[str], screen_text: str) -> list[str]:
@@ -1262,8 +1392,8 @@ def run_tv_links(
 ) -> PickerResult | None:
     return _run_tv(
         candidates,
-        "Visible links — Enter opens · Ctrl-Y copies · Ctrl-S changes order",
-        ("ctrl-y",),
+        "Visible links — Enter opens · Ctrl-E Neovim · Ctrl-Y copies · Ctrl-S changes order",
+        ("ctrl-e", "ctrl-y"),
         sort=sort,
         cwd=pane_path,
         preview=False,
@@ -1338,7 +1468,7 @@ def open_url(url: str) -> NoReturn:
 
 
 def open_in_nvim_split(
-    path: Path,
+    path: Path | str,
     line: str,
     pane_path: Path,
     pane_id: str,
@@ -1783,12 +1913,23 @@ def cmd_links(args: argparse.Namespace) -> None:
 
     screen_text = capture_pane_text(pane_id, backend)
     screen_text = strip_ansi(screen_text)
-    candidates = extract_visible_links(screen_text, sort="appearance")
+
+    # Issue/PR refs resolve against the source pane's repo, looked up only
+    # when the screen has a ref.
+    source_pane: list[Path] = []
+
+    def source_pane_path() -> Path:
+        if not source_pane:
+            source_pane.append(resolve_source_pane_path(pane_path, pane_id, backend))
+        return source_pane[0]
+
+    resolver = forge_ref_resolver(source_pane_path) if forge_refs_enabled() else None
+    candidates = extract_visible_links(screen_text, sort="appearance", resolve_ref=resolver)
 
     state = DebugState(
         pane_path=str(pane_path),
         pane_id=pane_id,
-        source_pane_path=str(pane_path),
+        source_pane_path=str(source_pane[0] if source_pane else pane_path),
         search_root="",
         candidate_count=len(candidates),
         screen_line_count=len(screen_text.splitlines()),
@@ -1836,6 +1977,13 @@ def cmd_links(args: argparse.Namespace) -> None:
 
     if picker_result.key == "ctrl-y":
         show_message(clipboard_message(status), backend)
+        return
+
+    if picker_result.key == "ctrl-e":
+        # nvim gets the URL itself; a BufReadCmd there can render it (an
+        # issue or PR view, say). Without one it is an empty buffer.
+        state.mode = "nvim"
+        open_in_nvim_split(selection, "", source_pane_path(), pane_id, backend)
         return
 
     open_url(selection)
