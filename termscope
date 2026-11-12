@@ -102,6 +102,10 @@ class MultiplexerBackend(ABC):
         """Show a short, non-blocking message to the user."""
         ...
 
+    def agent_transcripts(self) -> list[str]:
+        """Transcripts read by the last capture, source pane's first."""
+        return []
+
 
 class TmuxBackend(MultiplexerBackend):
     @property
@@ -319,7 +323,11 @@ class HerdrBackend(MultiplexerBackend):
         return pane_path
 
     def capture_pane_text(self, pane_id: str) -> str:
+        self._transcripts: list[str] = []
         return "\n".join(self._read_pane(pane) for pane in self._tab_panes(pane_id))
+
+    def agent_transcripts(self) -> list[str]:
+        return list(getattr(self, "_transcripts", []))
 
     def _read_pane(self, pane: dict) -> str:
         text = self._read_visible(pane)
@@ -328,7 +336,11 @@ class HerdrBackend(MultiplexerBackend):
         transcript_path = agent_transcript_path(pane.get("agent_session"))
         if transcript_path is None:
             return text
-        text, joins = rejoin_agent_wraps(text, read_transcript_text(transcript_path))
+        transcript = read_transcript_text(transcript_path)
+        if not hasattr(self, "_transcripts"):
+            self._transcripts = []
+        self._transcripts.append(transcript)
+        text, joins = rejoin_agent_wraps(text, transcript)
         log_event(
             "agent_rejoin",
             pane_id=pane.get("pane_id"),
@@ -741,12 +753,12 @@ def sort_items(items: dict[str, int], sort: str = "appearance") -> list[str]:
 def extract_visible_links(
     screen_text: str,
     sort: str = "appearance",
-    resolve_ref: Callable[[str | None, str | None, str], str | None] | None = None,
+    resolve_ref: Callable[[str | None, str | None, str], str | list[str] | None] | None = None,
 ) -> list[str]:
     """URLs on screen, in order. With ``resolve_ref``, issue/PR refs too.
 
     ``resolve_ref(owner, repo, number)`` turns a ``#12`` / ``repo#12`` /
-    ``owner/repo#12`` ref into a URL, or returns None to drop it.
+    ``owner/repo#12`` ref into a URL, several candidate URLs, or None to drop it.
     """
     raw_lines = screen_text.splitlines()
     matches: dict[str, int] = {}
@@ -767,8 +779,8 @@ def extract_visible_links(
             add(m.group(0), i)
         if resolve_ref is not None:
             for _, owner, repo, number in extract_forge_refs(line):
-                url = resolve_ref(owner, repo, number)
-                if url:
+                urls = resolve_ref(owner, repo, number) or []
+                for url in [urls] if isinstance(urls, str) else urls:
                     add(url, i)
 
     return sort_items(matches, sort)
@@ -867,24 +879,104 @@ def forge_remote(path: Path) -> tuple[str, str, str] | None:
     return f"https://{host}", owner, repo
 
 
+# A full issue/PR URL, or an `owner/repo#N` ref, in an agent transcript.
+_EVIDENCE_URL_RE = re.compile(
+    r"https?://([^/\s\"'<>()\[\]]+)/([\w.-]+)/([\w.-]+)/(issues|pulls?)/(\d+)(?!\d)"
+)
+_EVIDENCE_REF_RE = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w.-]*)/([A-Za-z0-9][\w.-]*)#(\d+)(?![\w-])")
+
+
+@dataclass
+class RefEvidence:
+    host: str | None  # None: seen only as owner/repo#N
+    owner: str
+    repo: str
+    kind: str  # "issues", "pull" or "pulls", as the URL had it
+
+
+def forge_ref_evidence(transcripts: list[str]) -> dict[str, list[RefEvidence]]:
+    """Issue/PR number -> the repos a transcript tied it to, best first.
+
+    Transcripts come source pane first; within one, the latest mention wins.
+    A repo seen both as a URL and as owner/repo#N keeps the URL's host and kind.
+    """
+    hosts: dict[tuple[str, str], str] = {}
+    result: dict[str, list[RefEvidence]] = {}
+    for transcript in transcripts:
+        seen: dict[tuple[str, str, str], tuple[int, RefEvidence]] = {}
+        for m in _EVIDENCE_URL_RE.finditer(transcript):
+            host, owner, repo, kind, number = m.groups()
+            if repo.endswith(".git"):
+                continue
+            key = (number, owner.lower(), repo.lower())
+            hosts.setdefault(key[1:], host)
+            seen[key] = (m.start(), RefEvidence(host, owner, repo, kind))
+        for m in _EVIDENCE_REF_RE.finditer(transcript):
+            owner, repo, number = m.groups()
+            key = (number, owner.lower(), repo.lower())
+            if key in seen:
+                pos, evidence = seen[key]
+                seen[key] = (max(pos, m.start()), evidence)
+            else:
+                seen[key] = (m.start(), RefEvidence(None, owner, repo, "issues"))
+        for (number, *_), (_, evidence) in sorted(seen.items(), key=lambda kv: -kv[1][0]):
+            known = result.setdefault(number, [])
+            if not any(
+                (e.owner.lower(), e.repo.lower()) == (evidence.owner.lower(), evidence.repo.lower())
+                for e in known
+            ):
+                known.append(evidence)
+    for candidates in result.values():
+        for evidence in candidates:
+            if evidence.host is None:
+                evidence.host = hosts.get((evidence.owner.lower(), evidence.repo.lower()))
+    return result
+
+
 def forge_ref_resolver(
     repo_path: Callable[[], Path],
-) -> Callable[[str | None, str | None, str], str | None]:
-    """Resolve refs against the repo at repo_path(), looked up on first use.
+    transcripts: list[str] | None = None,
+) -> Callable[[str | None, str | None, str], list[str]]:
+    """Resolve refs, from the agent's transcripts first, then repo_path()'s remote.
 
+    A ref the transcripts tie to a repo (a full URL, or owner/repo#N) resolves
+    there, so `#3355` an agent fetched from another project's GitHub opens
+    that. Several repos give several candidates. Otherwise the ref belongs to
+    the repo at repo_path(), whose remote is looked up on first use.
     `/issues/N` also covers PRs: GitHub, Gitea and Forgejo redirect it to the
     pull request when N is one.
     """
     remote: list[tuple[str, str, str] | None] = []
+    evidence: list[dict[str, list[RefEvidence]]] = []
 
-    def resolve(owner: str | None, repo: str | None, number: str) -> str | None:
+    def pane_remote() -> tuple[str, str, str] | None:
         if not remote:
             remote.append(forge_remote(repo_path()))
             log_event("forge_remote", remote=remote[0])
-        if remote[0] is None:
-            return None
-        base, default_owner, default_repo = remote[0]
-        return f"{base}/{owner or default_owner}/{repo or default_repo}/issues/{number}"
+        return remote[0]
+
+    def resolve(owner: str | None, repo: str | None, number: str) -> list[str]:
+        if not evidence:
+            evidence.append(forge_ref_evidence(transcripts or []))
+        urls = []
+        for e in evidence[0].get(number, []):
+            if repo and e.repo.lower() != repo.lower():
+                continue
+            if owner and e.owner.lower() != owner.lower():
+                continue
+            if e.host is not None:
+                base = f"https://{e.host}"
+            elif pane_remote() is not None:
+                base = pane_remote()[0]
+            else:
+                continue
+            urls.append(f"{base}/{e.owner}/{e.repo}/{e.kind}/{number}")
+        if urls:
+            return urls
+        if pane_remote() is None:
+            return []
+        base, default_owner, default_repo = pane_remote()
+        return [f"{base}/{owner or default_owner}/{repo or default_repo}/issues/{number}"]
 
     return resolve
 
@@ -1914,8 +2006,8 @@ def cmd_links(args: argparse.Namespace) -> None:
     screen_text = capture_pane_text(pane_id, backend)
     screen_text = strip_ansi(screen_text)
 
-    # Issue/PR refs resolve against the source pane's repo, looked up only
-    # when the screen has a ref.
+    # Issue/PR refs resolve from the agent transcripts the capture read, then
+    # against the source pane's repo, looked up only when needed.
     source_pane: list[Path] = []
 
     def source_pane_path() -> Path:
@@ -1923,7 +2015,11 @@ def cmd_links(args: argparse.Namespace) -> None:
             source_pane.append(resolve_source_pane_path(pane_path, pane_id, backend))
         return source_pane[0]
 
-    resolver = forge_ref_resolver(source_pane_path) if forge_refs_enabled() else None
+    resolver = (
+        forge_ref_resolver(source_pane_path, backend.agent_transcripts())
+        if forge_refs_enabled()
+        else None
+    )
     candidates = extract_visible_links(screen_text, sort="appearance", resolve_ref=resolver)
 
     state = DebugState(

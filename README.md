@@ -163,12 +163,16 @@ paths plus any visible `http://` / `https://` URLs.
 - If no visible file matches, the picker falls back to the full repo listing
   (visible URLs stay first). Indexing `$HOME` is skipped.
 - `termscope.open-links` lists URLs, plus issue and PR refs: `#12`,
-  `repo#12` and `owner/repo#12` become `https://<host>/<owner>/<repo>/issues/12`,
-  with the host, owner and repo filled in from the source pane's `origin`
-  remote. GitHub, Gitea and Forgejo redirect that URL to the pull request when
-  the number is one. An SSH remote's host goes through `ssh -G`, and a bare
-  name such as `gitea` is completed by DNS (e.g. Tailscale MagicDNS) to the
-  full name the web server's certificate covers.
+  `repo#12` and `owner/repo#12`. In a Claude Code or pi pane (Herdr), a ref
+  the agent's transcript ties to a repo, through a full issue/PR URL or an
+  `owner/repo#12`, opens there: an upstream GitHub PR the agent looked at
+  stays a GitHub PR even in a Gitea checkout. Several repos with that number
+  are all listed, latest mention first. Any other ref becomes
+  `https://<host>/<owner>/<repo>/issues/12`, filled in from the source pane's
+  `origin` remote; GitHub, Gitea and Forgejo redirect that URL to the pull
+  request when the number is one. An SSH remote's host goes through `ssh -G`,
+  and a bare name such as `gitea` is completed by DNS (e.g. Tailscale
+  MagicDNS) to the full name the web server's certificate covers.
 
 With the bindings above:
 
@@ -252,7 +256,7 @@ close_on_exit = true
 | `TERMSCOPE_OPENER` | Override default opener, e.g. `open -a Zen` or `open -a Firefox` |
 | `TERMSCOPE_SORT` | Default sort: `appearance` (default) or `alpha` |
 | `TERMSCOPE_FORGE_REFS` | `0` leaves issue and PR refs (`#12`, `owner/repo#12`) out of the link picker. Default: on |
-| `TERMSCOPE_AGENT_TRANSCRIPTS` | `0` stops Termscope reading Claude Code and pi transcripts to rejoin URLs and paths those agents wrapped (Herdr only). Default: on |
+| `TERMSCOPE_AGENT_TRANSCRIPTS` | `0` stops Termscope reading Claude Code and pi transcripts, which it uses to rejoin URLs and paths those agents wrapped and to tell which repo an issue/PR ref belongs to (Herdr only). Default: on |
 | `BAT_THEME` | `bat` theme for file previews. Default: `ansi`, the terminal's own colors, so text stays readable on light and dark themes |
 | `TERMSCOPE_LOG` | JSON event log path. Default: `$XDG_CACHE_HOME/termscope/termscope.log` (`~/.cache/...` if unset) |
 | `TERMSCOPE_DEBUG_DIR` | Directory for per-run debug dumps (unset = off) |

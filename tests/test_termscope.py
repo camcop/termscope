@@ -193,15 +193,15 @@ class TestForgeRefResolver(unittest.TestCase):
         with patch.object(tfp, "forge_remote", return_value=("https://g.test", "cam", "home")) as remote:
             resolve = tfp.forge_ref_resolver(repo_path)
             self.assertEqual(calls, [])
-            self.assertEqual(resolve(None, None, "7"), "https://g.test/cam/home/issues/7")
-            self.assertEqual(resolve(None, "workflow", "8"), "https://g.test/cam/workflow/issues/8")
-            self.assertEqual(resolve("me", "x", "9"), "https://g.test/me/x/issues/9")
+            self.assertEqual(resolve(None, None, "7"), ["https://g.test/cam/home/issues/7"])
+            self.assertEqual(resolve(None, "workflow", "8"), ["https://g.test/cam/workflow/issues/8"])
+            self.assertEqual(resolve("me", "x", "9"), ["https://g.test/me/x/issues/9"])
         remote.assert_called_once_with(Path("/tmp/repo"))
         self.assertEqual(calls, [1])
 
     def test_no_remote_drops_refs(self):
         with patch.object(tfp, "forge_remote", return_value=None):
-            self.assertIsNone(tfp.forge_ref_resolver(lambda: Path("/tmp"))(None, None, "7"))
+            self.assertEqual(tfp.forge_ref_resolver(lambda: Path("/tmp"))(None, None, "7"), [])
 
     def test_ssh_remote_uses_web_host(self):
         run = SimpleNamespace(returncode=0, stdout="gitea@gitea:cam/workflow.git\n")
@@ -212,6 +212,68 @@ class TestForgeRefResolver(unittest.TestCase):
                 ("https://gitea.example.ts.net", "cam", "workflow"),
             )
         web.assert_called_once_with("gitea")
+
+
+class TestForgeRefTranscripts(unittest.TestCase):
+    # The home_server session that motivated this: two of its own issues and
+    # an upstream GitHub PR and issue, all written as bare refs on screen.
+    TRANSCRIPT = "\n".join([
+        "Filed https://gitea.example.ts.net/cam/home_server/issues/796",
+        "gh pr view https://github.com/karakeep-app/karakeep/pull/3355",
+        "upstream issue karakeep-app/karakeep#3354 (https://github.com/karakeep-app/karakeep/issues/3354)",
+        "see karakeep-app/karakeep#3355 again",
+    ])
+
+    def resolver(self, *transcripts, remote=("https://gitea.example.ts.net", "cam", "home_server")):
+        patcher = patch.object(tfp, "forge_remote", return_value=remote)
+        self.remote = patcher.start()
+        self.addCleanup(patcher.stop)
+        return tfp.forge_ref_resolver(lambda: Path("/tmp/home_server"), list(transcripts))
+
+    def test_transcript_names_the_repo_host_and_kind(self):
+        resolve = self.resolver(self.TRANSCRIPT)
+        self.assertEqual(resolve(None, None, "3355"), ["https://github.com/karakeep-app/karakeep/pull/3355"])
+        self.assertEqual(resolve(None, None, "3354"), ["https://github.com/karakeep-app/karakeep/issues/3354"])
+        self.assertEqual(resolve(None, None, "796"), ["https://gitea.example.ts.net/cam/home_server/issues/796"])
+        self.remote.assert_not_called()
+
+    def test_no_evidence_falls_back_to_pane_repo(self):
+        resolve = self.resolver(self.TRANSCRIPT)
+        self.assertEqual(resolve(None, None, "12"), ["https://gitea.example.ts.net/cam/home_server/issues/12"])
+
+    def test_repo_qualifier_filters_evidence(self):
+        resolve = self.resolver(self.TRANSCRIPT)
+        self.assertEqual(resolve(None, "karakeep", "3355"), ["https://github.com/karakeep-app/karakeep/pull/3355"])
+        self.assertEqual(resolve(None, "workflow", "3355"), ["https://gitea.example.ts.net/cam/workflow/issues/3355"])
+
+    def test_several_repos_listed_latest_first(self):
+        resolve = self.resolver("a/one#5 then https://h.test/b/two/issues/5 then a/one#5")
+        self.assertEqual(
+            resolve(None, None, "5"),
+            ["https://gitea.example.ts.net/a/one/issues/5", "https://h.test/b/two/issues/5"],
+        )
+
+    def test_ref_only_repo_borrows_host_from_another_transcript(self):
+        resolve = self.resolver("x/y#9", "https://h.test/x/y/pulls/1")
+        self.assertEqual(resolve(None, None, "9"), ["https://h.test/x/y/issues/9"])
+
+    def test_source_transcript_ranks_first(self):
+        resolve = self.resolver("https://h.test/a/one/issues/5", "https://h.test/b/two/issues/5")
+        self.assertEqual(
+            resolve(None, None, "5"),
+            ["https://h.test/a/one/issues/5", "https://h.test/b/two/issues/5"],
+        )
+
+    def test_herdr_backend_keeps_transcripts_from_capture(self):
+        backend = tfp.HerdrBackend()
+        panes = [{"pane_id": "w1:p1", "agent_session": {"agent": "claude", "kind": "id", "value": "s"}}]
+        with patch.object(backend, "_tab_panes", return_value=panes), \
+             patch.object(backend, "_read_visible", return_value="#3355\n"), \
+             patch.object(tfp, "agent_transcript_path", return_value=Path("/tmp/s.jsonl")), \
+             patch.object(tfp, "read_transcript_text", return_value=self.TRANSCRIPT), \
+             patch.dict(os.environ, {"TERMSCOPE_AGENT_TRANSCRIPTS": "1"}):
+            backend.capture_pane_text("w1:p1")
+        self.assertEqual(backend.agent_transcripts(), [self.TRANSCRIPT])
 
 
 class TestLinkPickerRefs(unittest.TestCase):
